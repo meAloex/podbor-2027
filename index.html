@@ -38,7 +38,7 @@ body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding
 <script>
 /* Проверка возможностей браузера — отдельно и без современного синтаксиса, чтобы сообщение показалось даже в старом браузере */
 (function () {
-  var ok = !!(window.crypto && window.crypto.subtle && window.TextDecoder && window.fetch && window.Promise);
+  var ok = !!(window.crypto && window.crypto.subtle && window.TextDecoder && window.TextEncoder && window.fetch && window.Promise && window.DecompressionStream && window.MessageChannel && navigator.serviceWorker && window.isSecureContext);
   try { new Function('return async function () { await 0; }'); } catch (e) { ok = false; }
   if (!ok) {
     var e = document.getElementById('gate-err');
@@ -57,9 +57,9 @@ body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding
   var pw = document.getElementById('gate-pw'), btn = document.getElementById('gate-btn');
   var err = document.getElementById('gate-err'), prog = document.getElementById('gate-prog'), bar = document.getElementById('gate-bar');
   var hint = document.getElementById('gate-hint'), remember = document.getElementById('gate-remember');
-  var retryStored = null;
-
-  // шрифты не блокируют страницу: если Google Fonts недоступен, остаются системные
+  var retryStored = null, activeSession = null;
+  var siteBase = new URL('./', location.href);
+  var workerURL = new URL('asset-worker.js', siteBase);
   var FONTS = '';
   if (FONTS) { var fonts = document.createElement('link'); fonts.rel = 'stylesheet'; fonts.href = FONTS; document.head.appendChild(fonts); }
 
@@ -67,122 +67,169 @@ body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding
   function fromB64(s) { var b = atob(s), u = new Uint8Array(b.length); for (var i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; }
   function toB64(u) { var s = ''; for (var i = 0; i < u.length; i++) s += String.fromCharCode(u[i]); return btoa(s); }
   function store(get, val) { try { if (get) return localStorage.getItem(KEY_LS); if (val === null) localStorage.removeItem(KEY_LS); else localStorage.setItem(KEY_LS, val); } catch (e) { return null; } return null; }
-  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function normalize(p) { var s = String(p).replace(/\D/g, ''); return s.length === 24 ? s.match(/.{4}/g).join('-') : null; }
+  function messageForSession() { return activeSession ? { type: 'podbor-assets-init-v2', key: activeSession.key, assets: activeSession.assets } : { type: 'podbor-assets-locked-v2' }; }
 
-  // пароль: 24 цифры (одинаково в любой раскладке); пробелы, дефисы и невидимые символы прощаем
-  function normalize(p) {
-    var s = String(p).replace(/\D/g, '');
-    if (s.length !== 24) return null;
-    return s.match(/.{4}/g).join('-');
+  // A restarted worker asks this same controlled page to restore its volatile key.
+  navigator.serviceWorker.addEventListener('message', function (event) {
+    if (event.data && event.data.type === 'podbor-assets-need-key-v2' && event.ports[0]) event.ports[0].postMessage(messageForSession());
+  });
+  function sendSession(controller) {
+    return new Promise(function (resolve, reject) {
+      var channel = new MessageChannel();
+      channel.port1.onmessage = function (event) { channel.port1.close(); if (event.data && event.data.ok) resolve(); else reject(new Error('worker')); };
+      channel.port1.onmessageerror = function () { channel.port1.close(); reject(new Error('worker')); };
+      controller.postMessage(messageForSession(), [channel.port2]);
+    });
   }
+  navigator.serviceWorker.addEventListener('controllerchange', function () {
+    if (activeSession && navigator.serviceWorker.controller) sendSession(navigator.serviceWorker.controller).catch(function () { /* The next asset request can ask for rehydration. */ });
+  });
 
   async function deriveRaw(password) {
     var base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
-    var bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: fromB64(SALT), iterations: ITER }, base, 256);
-    return new Uint8Array(bits);
+    return new Uint8Array(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: fromB64(SALT), iterations: ITER }, base, 256));
   }
-  async function fetchBytes(id) {
-    var last;
-    for (var attempt = 0; attempt < 3; attempt++) {
-      try {
-        var r = await fetch('e/' + id + '.bin', id === 'm' ? { cache: 'no-cache' } : {});
-        if (r.ok) return new Uint8Array(await r.arrayBuffer());
-        last = new Error('net');
-      } catch (e) { last = e; }
-      await sleep(600 * (attempt + 1));
+  async function fetchDec(key, id, descriptor) {
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new Error('format');
+    var response;
+    try { response = await fetch(new URL('e/' + id + '.bin', siteBase), { cache: 'no-cache' }); if (!response.ok) throw new Error('net'); }
+    catch (_) { throw new Error('net'); }
+    var encrypted;
+    try { encrypted = new Uint8Array(await response.arrayBuffer()); } catch (_) { throw new Error('net'); }
+    var plain;
+    try { plain = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: encrypted.subarray(0, 12) }, key, encrypted.subarray(12))); }
+    catch (_) { throw new Error('bad'); }
+    if (descriptor) {
+      if (!Number.isSafeInteger(descriptor.size) || descriptor.size < 0 || descriptor.size > plain.length) throw new Error('format');
+      plain = plain.subarray(0, descriptor.size);
+      if (descriptor.encoding === 'gzip') plain = new Uint8Array(await new Response(new Blob([plain]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
+      else if (descriptor.encoding !== 'identity') throw new Error('format');
     }
-    throw new Error('net');
+    return plain;
   }
-  async function fetchDec(key, id, size) {
-    var u = await fetchBytes(id), plain;
-    try { plain = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: u.subarray(0, 12) }, key, u.subarray(12))); }
-    catch (e) { throw new Error('bad'); }
-    return typeof size === 'number' ? plain.subarray(0, size) : plain;
+  function activated(worker) {
+    return new Promise(function (resolve, reject) {
+      function check() { if (worker.state === 'activated') { worker.removeEventListener('statechange', check); resolve(); } else if (worker.state === 'redundant') { worker.removeEventListener('statechange', check); reject(new Error('worker')); } }
+      worker.addEventListener('statechange', check); check();
+    });
+  }
+  async function prepareWorker() {
+    var registration;
+    try {
+      // GitHub Pages project scope: this published folder and its descendants only.
+      registration = await navigator.serviceWorker.register(workerURL.href, { scope: siteBase.pathname, updateViaCache: 'none' });
+      var installing = registration.installing || registration.waiting;
+      if (installing) await activated(installing);
+      await navigator.serviceWorker.ready;
+      await new Promise(function (resolve) {
+        function check() { var controller = navigator.serviceWorker.controller; if (controller && controller.scriptURL === workerURL.href) { navigator.serviceWorker.removeEventListener('controllerchange', check); resolve(); } }
+        navigator.serviceWorker.addEventListener('controllerchange', check); check();
+      });
+      await sendSession(navigator.serviceWorker.controller);
+    } catch (_) { throw new Error('worker'); }
   }
   function runScript(code) {
     return new Promise(function (resolve, reject) {
-      var s = document.createElement('script');
-      s.src = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
-      s.onload = function () { resolve(); };
-      s.onerror = function () { reject(new Error('script')); };
-      document.body.appendChild(s);
+      var script = document.createElement('script'), url = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+      script.src = url; script.onload = function () { URL.revokeObjectURL(url); resolve(); }; script.onerror = function () { URL.revokeObjectURL(url); reject(new Error('script')); };
+      document.body.appendChild(script);
     });
   }
-  function rewrite(o, urls) {
-    if (Array.isArray(o)) { for (var i = 0; i < o.length; i++) { if (typeof o[i] === 'string' && urls[o[i]]) o[i] = urls[o[i]]; else if (o[i] && typeof o[i] === 'object') rewrite(o[i], urls); } }
-    else if (o && typeof o === 'object') { Object.keys(o).forEach(function (k) { var v = o[k]; if (typeof v === 'string' && urls[v]) o[k] = urls[v]; else if (v && typeof v === 'object') rewrite(v, urls); }); }
+  function captureAssetLinks(assets) {
+    var paths = new Set(Object.keys(assets).map(function (path) { return new URL(path, siteBase).pathname; }));
+    document.addEventListener('click', async function (event) {
+      var anchor = event.target.closest && event.target.closest('a[href]');
+      if (!anchor || event.defaultPrevented || event.button !== 0) return;
+      var url = new URL(anchor.href, location.href);
+      if (url.origin !== siteBase.origin || !paths.has(url.pathname)) return;
+      event.preventDefault();
+      var download = anchor.hasAttribute('download');
+      var target = event.ctrlKey || event.metaKey || event.shiftKey ? '_blank' : (anchor.target || '_self');
+      var opened = !download && target !== '_self' ? window.open('about:blank', target) : null;
+      try {
+        var response = await fetch(url.href); if (!response.ok) throw new Error('net');
+        var blobURL = URL.createObjectURL(await response.blob());
+        if (download) {
+          var link = document.createElement('a'); link.href = blobURL + url.hash; link.download = anchor.getAttribute('download') || url.pathname.split('/').pop(); link.click();
+        } else if (opened) { opened.opener = null; opened.location.replace(blobURL + url.hash); }
+        else if (target === '_self') location.href = blobURL + url.hash;
+        else { URL.revokeObjectURL(blobURL); throw new Error('popup'); }
+      } catch (_) {
+        if (opened) opened.close();
+        window.alert('Не удалось открыть файл. Проверьте интернет и разрешение на открытие вкладок, затем попробуйте ещё раз.');
+      }
+    }, true);
   }
-
   async function open(raw, fromStore) {
     var key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['decrypt']);
     var manifest = JSON.parse(new TextDecoder().decode(await fetchDec(key, 'm')));
+    if (!manifest.text || !manifest.assets) throw new Error('format');
     if (!fromStore && remember.checked) store(false, toB64(raw));
-    hint.textContent = 'Пароль верный. Загружаю и расшифровываю сайт…';
-    prog.hidden = false;
-    var assets = Object.keys(manifest.assets), names = Object.keys(manifest.text);
-    var total = assets.length + names.length, done = 0;
-    function tick() { done++; bar.style.width = Math.round(done / total * 100) + '%'; }
-    var text = {}, urls = {};
-    await Promise.all(names.map(async function (n) { var t = manifest.text[n]; text[n] = new TextDecoder().decode(await fetchDec(key, t.id, t.size)); tick(); }));
-    var queue = assets.slice();
-    async function worker() {
-      while (queue.length) {
-        var p = queue.shift(), a = manifest.assets[p];
-        urls[p] = URL.createObjectURL(new Blob([await fetchDec(key, a.id, a.size)], { type: a.type }));
-        tick();
-      }
-    }
-    await Promise.all([worker(), worker(), worker(), worker(), worker(), worker()]);
-
-    document.title = manifest.title;
-    var st = document.createElement('style'); st.textContent = text.css; document.head.appendChild(st);
-    var gs = document.getElementById('gate-style'); if (gs) gs.remove();
+    if (!fromStore && !remember.checked) store(false, null);
+    activeSession = { key: key, assets: manifest.assets };
+    hint.textContent = 'Пароль верный. Готовлю защищённые файлы…';
+    prog.hidden = false; bar.style.width = '10%';
+    await prepareWorker();
+    hint.textContent = 'Загружаю каталог и карту. Фотографии откроются по мере просмотра…';
+    var names = ['body', 'css', 'geo', 'catalog', 'map', 'budget', 'app'], text = {}, done = 0;
+    await Promise.all(names.map(async function (name) {
+      var descriptor = manifest.text[name]; if (!descriptor) throw new Error('format');
+      text[name] = new TextDecoder().decode(await fetchDec(key, descriptor.id, descriptor));
+      done++; bar.style.width = Math.round(10 + done / names.length * 90) + '%';
+    }));
+    document.title = manifest.title || 'Подбор квартиры';
+    var style = document.createElement('style'); style.textContent = text.css; document.head.appendChild(style);
+    var gateStyle = document.getElementById('gate-style'); if (gateStyle) gateStyle.remove();
     document.body.innerHTML = text.body;
-    await runScript(text.geo);
-    await runScript(text.catalog);
-    if (window.HOUSING_DATA) rewrite(window.HOUSING_DATA, urls);
-    await runScript(text.map);
-    await runScript(text.app);
+    captureAssetLinks(manifest.assets);
+    for (var i = 2; i < names.length; i++) await runScript(text[names[i]]);
     var about = document.getElementById('view-about');
     if (about) {
       var box = document.createElement('div'); box.className = 'section';
       box.innerHTML = '<h2>Пароль на этом устройстве</h2><p class="small">Если сайт запомнил пароль, а устройство чужое, нажмите кнопку.</p>';
-      var b = document.createElement('button'); b.type = 'button'; b.className = 'btn'; b.textContent = 'Забыть пароль на этом устройстве';
-      b.addEventListener('click', function () { store(false, null); location.reload(); });
-      box.appendChild(b); about.appendChild(box);
+      var button = document.createElement('button'); button.type = 'button'; button.className = 'btn'; button.textContent = 'Забыть пароль на этом устройстве';
+      button.addEventListener('click', function () {
+        store(false, null); activeSession = null;
+        if (navigator.serviceWorker.controller) { var channel = new MessageChannel(); navigator.serviceWorker.controller.postMessage({ type: 'podbor-assets-clear-v2' }, [channel.port2]); }
+        location.reload();
+      });
+      box.appendChild(button); about.appendChild(box);
     }
   }
-
   async function attempt(raw, fromStore) {
     btn.disabled = true; err.hidden = true; retryStored = null;
     try { await open(raw, fromStore); }
-    catch (e) {
-      var m = e && e.message;
-      if (m === 'bad') {
+    catch (error) {
+      activeSession = null;
+      var message = error && error.message;
+      if (message === 'bad') {
         if (fromStore) { store(false, null); hint.textContent = 'Введите пароль, который вам прислали.'; fail('Пароль сменился, введите новый.'); pw.focus(); }
         else fail('Пароль не подошёл. Проверьте и попробуйте ещё раз.');
-      } else if (m === 'net') {
+      } else if (message === 'net') {
         if (fromStore) retryStored = raw;
         fail('Не удалось загрузить сайт: проверьте интернет и нажмите «Повторить».', 'Повторить');
-      } else fail('Что-то пошло не так при открытии сайта. Обновите страницу.');
+      } else if (message === 'worker') fail('Браузер не разрешил открыть защищённые файлы. Откройте сайт по HTTPS в современном браузере и обновите страницу.');
+      else fail('Что-то пошло не так при открытии сайта. Обновите страницу.');
     }
   }
-
-  document.getElementById('gate').addEventListener('submit', async function (e) {
-    e.preventDefault();
-    if (retryStored) { var r = retryStored; btn.textContent = 'Открываю…'; await attempt(r, true); return; }
-    var p = normalize(pw.value);
-    if (!p) { fail('В пароле должно быть 24 цифры, дефисы можно не ставить.'); return; }
+  document.getElementById('gate').addEventListener('submit', async function (event) {
+    event.preventDefault();
+    if (retryStored) { var stored = retryStored; btn.textContent = 'Открываю…'; await attempt(stored, true); return; }
+    var password = normalize(pw.value);
+    if (!password) { fail('В пароле должно быть 24 цифры, дефисы можно не ставить.'); return; }
     btn.disabled = true; btn.textContent = 'Проверяю пароль…'; err.hidden = true;
     var raw;
-    try { raw = await deriveRaw(p); } catch (x) { fail('Не получилось проверить пароль в этом браузере.'); return; }
+    try { raw = await deriveRaw(password); } catch (_) { fail('Не получилось проверить пароль в этом браузере.'); return; }
     await attempt(raw, false);
   });
-
   var saved = store(true);
-  if (saved) { hint.textContent = 'Открываю сайт…'; btn.textContent = 'Открываю…'; attempt(fromB64(saved), true); }
-  else pw.focus();
+  if (saved) {
+    try { hint.textContent = 'Открываю сайт…'; btn.textContent = 'Открываю…'; attempt(fromB64(saved), true); }
+    catch (_) { store(false, null); fail('Не получилось прочитать сохранённый пароль. Введите его снова.'); pw.focus(); }
+  } else pw.focus();
 })();
 </script>
 </body>
 </html>
+
